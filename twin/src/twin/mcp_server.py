@@ -1,0 +1,287 @@
+"""The Twin's MCP tools. Built with the official `mcp` SDK (class MCPServer, formerly FastMCP).
+
+Right now: get_capabilities, list_nodes, get_readings, get_clock, list_actions, preview_action, actuate, the containment tools
+(isolate_sensor, quarantine_device, rollback_reading, release_device, get_containment_state, get_quarantine_lane)
+and run_scenario (hidden: fake_reading, stuck_sensor, replay_exact, real_jam, list, stop, reset).
+Next (see the plan): two-step commit, congestion_index, actuator controls.
+"""
+from importlib.metadata import version as pkg_version
+from typing import Any, Literal
+
+from mcp.server.context import ServerRequestContext
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
+from pydantic import BaseModel
+
+from . import __version__
+from .actions import ActionBook, ActionList, ActuateResult, BadRequest, PreviewResult
+from .graph import CityGraph, GraphBook, NearestNodes
+from .models import Layout
+from .scenarios import ScenarioBook, ScenarioResult
+from .containment import (ContainmentBook, ContainmentState, ContainResult, QuarantineLane, ReleaseResult,
+                          RollbackResult)
+from .auth import HIDDEN_TOOLS, TOOL_ACCESS, Identity, KeyRing, token_from_headers
+from .models import ClockInfo, Node, ReadingsBatch, Topology
+from .sim import Simulation
+
+Domain = Literal["traffic", "water", "power", "air_quality", "emergency"]
+
+
+class Capabilities(BaseModel):
+    layer: str
+    layer_version: str
+    mcp_sdk_version: str
+    protocol_version: str
+    authenticated_as: str | None     # None means the key was missing or unknown
+    tools_you_can_call: list[str]
+    features: dict[str, Any] = {}    # what this Twin supports and what is not built (added 23 Oct, CIVIS acceptance list)
+
+
+class NodeList(BaseModel):
+    seed: int
+    count: int
+    nodes: list[Node]
+
+
+def _identity(ctx: ServerRequestContext, keyring: KeyRing) -> Identity | None:
+    request = ctx.request                           # the HTTP request this message came in on
+    return keyring.identify(token_from_headers(request.headers)) if request is not None else None
+
+
+def build_mcp(topology: Topology, keyring: KeyRing, sim: Simulation, book: ActionBook,
+              containment: ContainmentBook, scenarios: ScenarioBook, layout: Layout | None = None) -> MCPServer:
+    mcp = MCPServer(
+        "twin",
+        title="Twin: simulated city",
+        instructions="Simulated city for TSYP14 Triplet 04. Send 'Authorization: Bearer <your key>'. "
+                     "Call get_capabilities first.",
+        version=__version__,
+    )
+
+    graph_cache: list[GraphBook] = []        # built on the first call, then reused: the graph never changes in a run
+
+    def graph_book() -> GraphBook:
+        if not graph_cache:
+            graph_cache.append(GraphBook(topology, layout, book.list_actions(), sim.run_id))
+        return graph_cache[0]
+
+    def caller(ctx: Context) -> Identity | None:
+        return _identity(ctx.request_context, keyring)
+
+    def require(ctx: Context, tool: str) -> Identity:
+        """Clear errors: not logged in is different from logged in but not allowed."""
+        who = caller(ctx)
+        if who is None:
+            raise ToolError("UNAUTHENTICATED: missing or unknown key. Send 'Authorization: Bearer <your key>'.")
+        allowed = TOOL_ACCESS[tool]
+        if allowed is not None and who not in allowed:
+            raise ToolError(f"FORBIDDEN: '{who.value}' may not call {tool}.")
+        return who
+
+    @mcp.tool()
+    def get_capabilities(ctx: Context) -> Capabilities:
+        """What this Twin is, which versions it runs, who you are logged in as, and which tools you can call.
+        Works without a key, so a wrong key can be diagnosed in one call."""
+        who = caller(ctx)
+        # Only tools this caller can really call: open to anyone (None) or the caller is on the list.
+        visible = [t for t, allowed in TOOL_ACCESS.items()
+                   if allowed is None or (who is not None and who in allowed)]
+        return Capabilities(
+            layer="twin", layer_version=__version__, mcp_sdk_version=pkg_version("mcp"),
+            protocol_version=ctx.request_context.protocol_version,
+            authenticated_as=who.value if who else None, tools_you_can_call=visible,
+            features={
+                "token_formats": ["g1", "jws-eddsa"], "token_mode": book.cfg.tokens.mode,
+                "token_max_lifetime_seconds": 60, "token_score_range": [0, 1],
+                "preview_action": True, "two_step_commit": False, "idempotency": True, "city_graph": True,
+                "containment_tools": ["isolate_sensor", "quarantine_device", "rollback_reading", "release_device"],
+                "live_feed": "sse:/events", "sensors": sorted(sim.sensor_names),
+                "not_built": ["commit_action (two-step)", "get_flagged_readings", "Telecom and Waste domains"]})
+
+    @mcp.tool()
+    def list_nodes(ctx: Context, domain: Domain | None = None) -> NodeList:
+        """List the nodes of the city (id, domains, zone, position, sensors with units, actuators, neighbours).
+        Optionally only one domain. Never includes normal ranges: the Twin publishes no datasheet."""
+        require(ctx, "list_nodes")
+        nodes = [n for n in topology.nodes if domain is None or domain in n.domains]
+        return NodeList(seed=topology.seed, count=len(nodes), nodes=nodes)
+
+    @mcp.tool()
+    def get_city_graph(ctx: Context, include_matrix: bool = True, include_roads: bool = True) -> CityGraph:
+        """The whole city as a graph, in one call: every node (position, GPS, zone, domains, role, sensors with units,
+        the actions it can carry out with risk level), every link between nodes (distance in metres, compass bearing,
+        same-domain or cross-domain), the zones, the roads, and the straight-line distance between EVERY pair of nodes
+        (`distance_matrix_m`, in the order of `node_order`). Distances are straight lines over the ground, not along roads
+        or pipes. The graph is the same for the whole run. Set include_matrix or include_roads to false for a smaller reply.
+        It holds the layout of the city only, no sensor datasheet data."""
+        require(ctx, "get_city_graph")
+        return graph_book().graph(include_matrix, include_roads)
+
+    @mcp.tool()
+    def get_nearest_nodes(ctx: Context, node_id: str, domain: Domain | None = None, role: str | None = None,
+                          limit: int = 5) -> NearestNodes:
+        """The nodes closest to `node_id`, nearest first, each with its straight-line distance in metres, the compass
+        bearing from `node_id`, and whether the two are linked in the graph. Optional filters: `domain` (for example
+        water) or `role` (standard, call_place, dispatch_center). `limit` is 1 to 50."""
+        require(ctx, "get_nearest_nodes")
+        gb = graph_book()
+        if node_id not in gb.by_id:
+            raise ToolError(f"UNKNOWN_NODE: '{node_id}' is not a node. Call list_nodes for the node ids.")
+        if role is not None and role not in gb.roles:
+            raise ToolError(f"UNKNOWN_ROLE: '{role}' is not a role. Known: {', '.join(sorted(gb.roles))}.")
+        if not 1 <= limit <= 50:
+            raise ToolError("BAD_LIMIT: limit must be from 1 to 50.")
+        return gb.nearest(node_id, domain, role, limit)
+
+    @mcp.tool()
+    def get_readings(ctx: Context, domain: Domain | None = None, node_id: str | None = None,
+                     sensor: str | None = None) -> ReadingsBatch:
+        """The latest readings (what the sensors report right now), all of them or filtered by domain, node_id
+        and/or sensor name. Values are what the sensors report. Sensors can be wrong, so a reading is a report, not a fact.
+        A null value means the sensor gave no value. Each reading carries a tick and a simulated UTC timestamp."""
+        require(ctx, "get_readings")
+        if node_id is not None and node_id not in sim.node_ids:
+            raise ToolError(f"UNKNOWN_NODE: '{node_id}' is not a node. Call list_nodes for the node ids.")
+        if sensor is not None and sensor not in sim.sensor_names:
+            raise ToolError(f"UNKNOWN_SENSOR: '{sensor}' is not a sensor. Known: {', '.join(sorted(sim.sensor_names))}.")
+        return sim.current(domain=domain, node_id=node_id, sensor=sensor)
+
+    @mcp.tool()
+    def get_clock(ctx: Context) -> ClockInfo:
+        """The simulated clock: run id, current tick, simulated UTC time, tick length in simulated seconds,
+        and the speed (1.0 = one simulated second per real second)."""
+        require(ctx, "get_clock")
+        return sim.clock_info()
+
+    @mcp.tool()
+    def list_actions(ctx: Context) -> ActionList:
+        """Every action `actuate` accepts: inputs with allowed values, risk level (R1 to R3, or null), whether a
+        preview is required, the nodes that can carry it out, and the cap on nodes per request."""
+        require(ctx, "list_actions")
+        return book.list_actions()
+
+    @mcp.tool()
+    def actuate(ctx: Context, action: str, targets: list[str], idempotency_key: str, token: str | None = None,
+                params: dict[str, Any] | None = None) -> ActuateResult:
+        """Ask the Twin to carry out one action on one or more nodes. Needs a token from Guardian for exactly this
+        action, targets and params. Repeating a request with the same idempotency_key returns the first answer;
+        using the key for a different request is refused. A wrong request fails with a code and a message. A
+        refused request (bad token, cap exceeded, ...) comes back as status "rejected" with a code."""
+        who = require(ctx, "actuate")
+        try:
+            return book.actuate(who, action, targets, params, token, idempotency_key)
+        except BadRequest as e:
+            raise ToolError(f"{e.code}: {e.message}") from None
+
+    @mcp.tool()
+    def preview_action(ctx: Context, action: str, targets: list[str],
+                       params: dict[str, Any] | None = None) -> PreviewResult:
+        """Dry-run of `actuate`: shows what the action WOULD change (old and new value per node) and whether the caps
+        and quarantine checks would pass. Changes nothing and needs no token. Only for actions with
+        preview_required (see list_actions). Actions with preview_required are refused (code PREVIEW_REQUIRED) unless
+        you previewed exactly the same action, targets and params shortly before. One preview allows one commit.
+        A preview is not a permission: the real action still needs Guardian's token."""
+        who = require(ctx, "preview_action")
+        try:
+            return book.preview(who, action, targets, params)
+        except BadRequest as e:
+            raise ToolError(f"{e.code}: {e.message}") from None
+
+    def contain_call(fn, *args):
+        try:
+            return fn(*args)
+        except BadRequest as e:
+            raise ToolError(f"{e.code}: {e.message}") from None
+
+    @mcp.tool()
+    def isolate_sensor(ctx: Context, device_ids: list[str], reason: str | None = None,
+                       caused_by: list[str] | None = None) -> ContainResult:
+        """Guardian only. Cut these devices' data off the main feed. Counts against the isolation cap (nodes per
+        domain, shared with quarantine). Repeating it is harmless. A request that would break a cap is refused as a
+        whole: status "rejected", code CAP_EXCEEDED, with domain, cap, in_use, requested, remaining.
+        caused_by (optional): ids of earlier events, for example Guardian's verdict. Only written to the run log."""
+        require(ctx, "isolate_sensor")
+        return contain_call(containment.contain, "isolate_sensor", device_ids, reason, caused_by)
+
+    @mcp.tool()
+    def quarantine_device(ctx: Context, device_ids: list[str], reason: str | None = None,
+                          caused_by: list[str] | None = None) -> ContainResult:
+        """Guardian only. Same cut as isolate_sensor, and commands to the device's node are held in a side lane
+        instead of being carried out (answer DEVICE_QUARANTINED). The held data and commands can be read with
+        get_quarantine_lane. Shares the isolation cap with isolate_sensor."""
+        require(ctx, "quarantine_device")
+        return contain_call(containment.contain, "quarantine_device", device_ids, reason, caused_by)
+
+    @mcp.tool()
+    def rollback_reading(ctx: Context, reading_ids: list[str], caused_by: list[str] | None = None) -> RollbackResult:
+        """Guardian only. Replace bad readings with the last trusted value the sensor REPORTED (never the Twin's
+        true value). Each answer is marked corrected and names the reading it corrects. Own cap pool (nodes per
+        domain). A reading that was already corrected is returned unchanged."""
+        require(ctx, "rollback_reading")
+        return contain_call(containment.rollback, reading_ids, caused_by)
+
+    @mcp.tool()
+    def release_device(ctx: Context, device_ids: list[str], caused_by: list[str] | None = None) -> ReleaseResult:
+        """Guardian only. Undo isolate, quarantine and rollback for these devices. Data flows again from the
+        current tick and the cap slots are free again."""
+        require(ctx, "release_device")
+        return contain_call(containment.release, device_ids, caused_by)
+
+    @mcp.tool()
+    def get_containment_state(ctx: Context) -> ContainmentState:
+        """Which devices are isolated or quarantined, which readings were corrected, and how much of each
+        domain's isolation and rollback cap is in use. Held data is not included (see get_quarantine_lane)."""
+        require(ctx, "get_containment_state")
+        return containment.state()
+
+    @mcp.tool()
+    def get_quarantine_lane(ctx: Context) -> QuarantineLane:
+        """Guardian only. What quarantined devices report right now (kept off the main feed) and the commands
+        that were held because their node is quarantined."""
+        require(ctx, "get_quarantine_lane")
+        return containment.lane()
+
+    @mcp.tool()
+    async def run_scenario(ctx: Context, name: str, params: dict[str, Any] | None = None) -> ScenarioResult:
+        """Start an attack or a real event on purpose. Hidden: only visible to a caller with the scenario key.
+        name: fake_reading, stuck_sensor or replay_exact (attacks), real_jam (a real traffic jam), each works with no params,
+        or list, stop, reset.
+        params: device_id, channel, delay_ticks, duration_ticks, plus value (fake_reading) or lag_ticks (replay_exact);
+        real_jam takes node_id, delay_ticks, ramp_ticks, hold_ticks, fade_ticks, spread; stop takes scenario_id.
+        Attacks change what a sensor REPORTS, never the true value. A real jam moves the true value, so every sensor
+        at the node reports what is really there."""
+        require(ctx, "run_scenario")
+        try:
+            return await scenarios.run(name, params)
+        except BadRequest as e:
+            raise ToolError(f"{e.code}: {e.message}") from None
+
+    async def access_filter(ctx: ServerRequestContext, call_next):
+        """Hides tools from callers who may not use them (tool list and tool calls)."""
+        who = _identity(ctx, keyring)
+
+        def visible(tool_name: str) -> bool:
+            if tool_name not in HIDDEN_TOOLS:
+                return True
+            allowed = TOOL_ACCESS.get(tool_name)
+            return who is not None and allowed is not None and who in allowed
+
+        if ctx.method == "tools/call":
+            name = (ctx.params or {}).get("name", "")
+            if not visible(name):
+                # Exactly what the SDK answers for a tool that does not exist (a tool-level error result),
+                # so a caller cannot tell "hidden" from "not there".
+                return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")], is_error=True)
+        result = await call_next(ctx)
+        if ctx.method == "tools/list":
+            def keep(t) -> bool:
+                return visible(t["name"] if isinstance(t, dict) else t.name)
+            if isinstance(result, dict):
+                result["tools"] = [t for t in result["tools"] if keep(t)]
+            else:
+                result.tools = [t for t in result.tools if keep(t)]
+        return result
+
+    mcp.middleware.append(access_filter)
+    return mcp

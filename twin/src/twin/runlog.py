@@ -1,0 +1,236 @@
+"""The run log (R2): every scenario run leaves a log file in the repo.
+
+Two steps, so three layers never write into one file at the same time:
+  1. Each layer writes its OWN part file while it runs. The Twin's is  <parts_dir>/<run_id>.twin.jsonl
+  2. A merge step puts all the parts together, in time order, into ONE file per run: <merged_dir>/<run_id>.jsonl
+     (the spec's `logs/` folder, "one file per run").
+
+The file format is JSON Lines: one JSON object per line. Why: if the Twin crashes, only the last line can be broken,
+and a program can read the file while it is still being written. The format below is OUR DRAFT (proposed to CIVIS and
+9antra, review on 9 Oct). All of it is in this one file, so a change is cheap.
+
+Every line has:
+  run_id, event_id (twin-000001), timestamp (simulated time of the tick), tick, wall (real clock, orders events inside one
+  tick), layer, event_type, caused_by (list of earlier event_ids), data (depends on event_type).
+Event types the Twin writes: scenario, reading, action, containment.
+  reading     only readings a scenario touched: a fault (fake, stuck, replay) or a real incident (`real_jam`, added 2 Nov: the
+              jam sensors of every affected node, so a verdict can point at them). 120 per tick would be huge. A verdict that
+              points at a normal reading finds no matching reading here. That gap is on purpose.
+  action      what `actuate` answered. Only the token's ID is logged, never the token (a logged token could be replayed).
+
+The shared log must never hold a true value. True values go to <parts_dir>/<run_id>.twin-private.jsonl, which is never merged.
+The log is for people (and the dashboard) to read AFTERWARDS. Layers must not read it to make decisions.
+"""
+import json
+import logging
+import os
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .settings import LoggingCfg
+
+log = logging.getLogger("twin.runlog")
+
+LAYER_ORDER = {"twin": 0, "guardian": 1, "brain": 2}
+
+
+def _wall() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class RunLog:
+    def __init__(self, cfg: LoggingCfg, sim, scenarios, run_info: dict[str, Any]):
+        self.cfg, self.sim, self.scenarios, self.run_info = cfg, sim, scenarios, run_info
+        self.enabled = cfg.enabled
+        self.parts_dir, self.merged_dir = Path(cfg.parts_dir), Path(cfg.merged_dir)
+        self._lock = threading.Lock()
+        self._run: int | None = None            # run_number the open files belong to
+        self._run_id = ""
+        self._n = 0                              # last event number in the part file
+        self._warned = False
+        self.sink = None                         # optional: called with every line written (the history writer)
+
+    # ------------------------------------------------------------------ files
+    def part_path(self, run_id: str) -> Path:
+        return self.parts_dir / f"{run_id}.twin.jsonl"
+
+    def private_path(self, run_id: str) -> Path:
+        return self.parts_dir / f"{run_id}.twin-private.jsonl"
+
+    def merged_path(self, run_id: str) -> Path:
+        return self.merged_dir / f"{run_id}.jsonl"
+
+    def _append(self, path: Path, line: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:          # one short line, flushed at once: a crash loses at most the last line
+            f.write(json.dumps(line, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    # ------------------------------------------------------------------ writing events
+    def record(self, event_type: str, data: dict[str, Any], *, caused_by: list[str] | None = None) -> str | None:
+        """Write one event of the Twin. Returns its event_id. Never raises: a full disk must not stop the Twin."""
+        if not self.enabled:
+            return None
+        try:
+            with self._lock:
+                self._open_run_if_new()
+                return self._write(event_type, data, caused_by)
+        except OSError as e:
+            self._warn(e)
+            return None
+
+    def _write(self, event_type: str, data: dict[str, Any], caused_by: list[str] | None, tick: int | None = None) -> str:
+        tick = self.sim.tick if tick is None else tick        # a reading event carries the tick it describes
+        self._n += 1
+        eid = f"twin-{self._n:06d}"
+        line = {"run_id": self._run_id, "event_id": eid, "timestamp": self.sim.clock.iso_of(tick), "tick": tick,
+                "wall": _wall(), "layer": "twin", "event_type": event_type, "caused_by": caused_by or [], "data": data}
+        self._append(self.part_path(self._run_id), line)
+        if self.sink is not None:
+            try:
+                self.sink(line)                                  # the queue only: never waits for a database
+            except Exception:                                    # history must never break the run log
+                log.exception("history sink failed")
+        return eid
+
+    def _open_run_if_new(self) -> None:
+        """First event of a run: remember the run, continue numbering if the part file already exists (a restart reuses the run id)."""
+        if self._run == self.sim.run_number:
+            return
+        self._run, self._run_id = self.sim.run_number, self.sim.run_id
+        path = self.part_path(self._run_id)
+        self._n = sum(1 for _ in open(path, encoding="utf-8")) if path.exists() else 0
+        self._write("scenario", {"phase": "run_started", **self.run_info}, None)
+
+    def _warn(self, e: Exception) -> None:
+        if not self._warned:                                   # say it once, not on every tick
+            self._warned = True
+            log.warning("Run log could not be written (%s). The Twin keeps running without it.", e)
+
+    # ------------------------------------------------------------------ faulted readings
+    def log_tick(self, tick: int) -> None:
+        """Write the readings a scenario fault touched at this tick, and (privately) the true values behind them."""
+        if not self.enabled or self.scenarios is None:
+            return
+        rows = []                                              # (scenario_id, record id, kind, device, channel, reading)
+        for f in self.scenarios.active_faults(tick):
+            d = self.scenarios.devices[f.device_id]
+            if self.sim.overlay is not None and self.sim.overlay.is_hidden(d.device_id, tick):
+                continue                                       # cut off from the feed: nobody saw it
+            for ch in ([f.channel] if f.channel else list(d.channels or (None,))):
+                r = self.sim.reported(d, ch, tick)
+                rows.append((f.scenario_id, f.fault_id, f.kind, d, ch, r))
+        for inc in self.scenarios.active_incidents(tick):      # a real incident: the readings it moves are logged too
+            for d in self.scenarios.incident_devices(inc):
+                if self.sim.overlay is not None and self.sim.overlay.is_hidden(d.device_id, tick):
+                    continue
+                for ch in (d.channels or (None,)):
+                    rows.append((inc.scenario_id, inc.incident_id, inc.kind, d, ch, self.sim.reported(d, ch, tick)))
+        if not rows:
+            return
+        try:
+            with self._lock:
+                self._open_run_if_new()
+                for sid, record_id, kind, d, ch, r in rows:
+                    started = self.scenarios.event_id_of(sid)
+                    eid = self._write("reading", {"reading_id": r.reading_id, "reading_tick": r.tick, "node_id": r.node_id,
+                                                  "device_id": r.device_id, "sensor": r.sensor, "channel": r.channel,
+                                                  "value": r.value, "unit": r.unit},
+                                      [started] if started else [], tick=tick)
+                    self._append(self.private_path(self._run_id), {
+                        "run_id": self._run_id, "tick": tick, "wall": _wall(), "event_id": eid, "reading_id": r.reading_id,
+                        "device_id": d.device_id, "channel": ch, "reported_value": r.value,
+                        "true_value": self.sim.model.true_value(d, ch, tick), "fault_id": record_id, "fault_kind": kind})
+        except OSError as e:
+            self._warn(e)
+
+    async def follow_clock(self) -> None:
+        """Background job: for every tick that passes, log the faulted readings."""
+        seen_run, seen_tick = self.sim.run_number, -1
+        while True:
+            run, tick = self.sim.run_number, self.sim.tick
+            if run != seen_run:                                 # a new run starts again at tick 0
+                seen_run, seen_tick = run, -1
+            for t in range(seen_tick + 1, tick + 1):
+                self.log_tick(t)
+            seen_tick = tick
+            await self.sim.wait_for_change(run, tick, 1.0)
+
+    # ------------------------------------------------------------------ merging
+    def partner_parts(self, run_id: str) -> list[Path]:
+        """Part files of the other layers that sit in OUR parts folder (<run_id>.guardian.jsonl, <run_id>.brain.jsonl).
+        Only these two exact names are picked up: never the private file with true values (<run_id>.twin-private.jsonl)."""
+        return [p for layer in ("guardian", "brain") if (p := self.parts_dir / f"{run_id}.{layer}.jsonl").exists()]
+
+    def export(self, extra_parts: list[Path] | None = None) -> Path | None:
+        """(Re)write the merged file of the current run from every part we can find: ours, the partners' part files
+        in our folder (added 27 Oct, so a stand-in's or a partner's events do not vanish when the Twin merges), and any
+        you pass in. If a partner's file belongs to another run, say so and merge only the Twin's own events."""
+        if not self.enabled or self._run is None:
+            return None
+        parts = [self.part_path(self._run_id), *self.partner_parts(self._run_id), *(extra_parts or [])]
+        try:
+            return merge_parts(parts, self.merged_path(self._run_id))
+        except ValueError as e:                                  # parts of different runs: never mix them
+            log.warning("Partner part files not merged: %s", e)
+            try:
+                return merge_parts([self.part_path(self._run_id)], self.merged_path(self._run_id))
+            except OSError as e2:
+                self._warn(e2)
+                return None
+        except OSError as e:
+            self._warn(e)
+            return None
+
+    def end_run(self) -> Path | None:
+        """The run is over (reset or shutdown): write a closing event, then the merged file."""
+        if not self.enabled or self._run is None:
+            return None
+        self.record("scenario", {"phase": "run_ended"})
+        return self.export()
+
+
+# ---------------------------------------------------------------------- merge (also used by the command line tool)
+def read_part(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Read a part file. A line that is not valid JSON (for example a half-written last line) is skipped and counted."""
+    events, bad = [], 0
+    if not Path(path).exists():
+        return events, bad
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and {"run_id", "event_id", "tick", "layer", "event_type"} <= obj.keys():
+                    events.append(obj)
+                    continue
+            except json.JSONDecodeError:
+                pass
+            bad += 1
+    return events, bad
+
+
+def merge_parts(parts: list[Path], out: Path) -> Path:
+    """Put the events of all part files in one list, in time order, and write it to `out` in one go (no half-written file).
+
+    Order: tick, then real clock (wall), then layer, then event number. Events of different runs are refused:
+    a merged file belongs to exactly one run.
+    """
+    events: list[dict[str, Any]] = []
+    for p in parts:
+        got, bad = read_part(p)
+        if bad:
+            log.warning("%s: %d unreadable line(s) skipped", p, bad)
+        events += got
+    if len({e["run_id"] for e in events}) > 1:
+        raise ValueError(f"Parts belong to different runs: {sorted({e['run_id'] for e in events})}")
+    events.sort(key=lambda e: (e["tick"], e.get("wall", ""), LAYER_ORDER.get(e["layer"], 9), e["event_id"]))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e, separators=(",", ":"), ensure_ascii=False) + "\n")
+    os.replace(tmp, out)                                         # the old file is swapped for the new one in one step
+    return out
