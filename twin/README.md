@@ -1,10 +1,10 @@
-# Twin layer (Trinity, Triplet 04)
+# Twin layer (Trinity, Triplet D)
 
 The Twin is the simulated city: sensors that report readings, actuators that act on the city, and a set of tools
 the City Brain and the Guardian call. It runs on its own. This README only covers the Twin. How the three layers
-fit together is in the root `INTEGRATION.md`. What the Twin sends and receives is in `INTERFACE.md`.
+fit together will be in the root `INTEGRATION.md` (still a draft). What the Twin sends and receives is in `INTERFACE.md`.
 
-**Status (4 Nov 2026): 544 tests passing and 18 skipped (8 need a PostgreSQL database, 10 need a Redis server).** New on 3 and 4 Nov: one real incident, the jam scenario `real_jam`, and one trigger script per scenario in `../scenarios/` (see "Scenario scripts"). Earlier, on 27 to 31 Oct: scripted stand-ins for the Brain and the Guardian that write their own run logs (`mocks/`, see "Stand-ins"), and live sensor values on the dashboard. Earlier, on 23 Oct: the `congestion_index` sensor (percent, one per traffic node, 120 readings per tick) and Guardian's own `g1` token format. The app starts, partners log in with their own key, the city is generated from a seed, a simulated clock ticks, and every tick the 120 sensor readings go out on the live feed and through `get_readings`. `actuate` works behind the token gate, with idempotency and caps. Containment tools, attack scenarios, the run log and the dashboard (dark theme, node style spec) are built. History storage is built (memory by default, TimescaleDB optional; see "History storage"). Redis action state is built (14 Oct, optional, off by default). Dry-run preview is built (16 Oct, `preview_action`). Not built: two-step commit and actuator effects on the city. The signed-token check (Ed25519) is built and tested but off in the default config (see "Known limits right now").
+**Status (26 Nov 2026): 550 tests pass and 18 are skipped (fresh `pytest` run inside `twin/`).** This is the Phase 1 Twin carried into Triplet D. It has not been run against Triplet D's Brain or Guardian yet. Built: the city generated from a seed, a simulated clock, 120 sensor readings per tick on the live feed and through `get_readings`, one key per caller, `actuate` behind the token gate with idempotency and caps, dry-run preview (`preview_action`), containment tools, attack scenarios and one real incident (`real_jam`), the run log, the dashboard, scripted stand-ins for the Brain and the Guardian (`mocks/`), and optional TimescaleDB history and Redis action state (both off by default). Not built: two-step commit, undo of committed actions, and actuator effects on the city. The signed-token check (Ed25519) is built and tested but off in the default config (see "Known limits right now").
 
 ## Run it
 
@@ -84,7 +84,7 @@ python mocks/example_client.py --key dev-scenario-key-change-me --tool run_scena
 python mocks/example_client.py --key dev-scenario-key-change-me --tool run_scenario --args '{"name": "stuck_sensor", "params": {"device_id": "AIR-01.pm25", "duration_ticks": 60}}'
 ```
 
-One command starts an attack. With no `params` each one has a default sensor, so `fake_reading` is the spec's T5 case: `WAT-01.water_level` reports 180 cm while the real level stays about 40.
+One command starts an attack. With no `params` each one has a default sensor, so `fake_reading` is the stock fake-reading case: `WAT-01.water_level` reports 180 cm while the real level stays about 40.
 
 | Name | What the sensor does |
 |---|---|
@@ -108,7 +108,7 @@ python mocks/example_client.py --key dev-scenario-key-change-me --tool run_scena
 With no `params` it starts at SH-05 (the first traffic node that carries a signal) 2 ticks later. What it does:
 
 * **Shape.** It builds up over `ramp_ticks` (default 10), holds the peak for `hold_ticks` (default 40), fades over `fade_ticks` (default 10) and ends by itself. It never jumps, because a sudden jump looks like a fake reading to a rate-of-change check. `stop` ends it at once, with no fade.
-* **At the centre node:** `congestion_index` goes to 90, `vehicle_count` to 120 and `avg_speed` to 8. That passes the Brain's S01 rule (index of at least 80 on two ticks in a row).
+* **At the centre node:** `congestion_index` goes to 90, `vehicle_count` to 120 and `avg_speed` to 8. That passes the Phase 1 Brain's jam rule (index of at least 80 on two ticks in a row), which the mock Brain copies.
 * **Neighbours.** Traffic nodes linked to the centre feel `spread` (default 0.35) of the jam: about 50 on the index, so they clearly rise but do not trip the rule. A fake spike is a lone sensor; a real jam also moves its neighbours. Air-quality neighbours and every other sensor stay as they were. `spread: 0` keeps the jam on one node.
 * **Same seed, same run.** The values depend only on the seed, the tick and the jam record, so a replay gives the same run. Nothing before the start tick changes.
 * **Logged.** The readings it moves are written to the run log as `reading` events linked to the jam's `started` event, so a verdict can point at them. The true values go only to the private file.
@@ -125,8 +125,8 @@ With no `params` it starts at SH-05 (the first traffic node that carries a signa
 | List nodes, readings, actions, the clock | Yes | `example_client.py` tools above |
 | Make the Twin act through the trust gate | Yes, with test tokens | `token_tool.py` plus `actuate` |
 | See the city as a map and a timeline screen (R3) | **Yes** | `python -m twin.dashboard`, see "The dashboard" below. The map and timeline show logged events; the newest sensor values come from the Twin's live feed, so a quiet Twin still shows a moving tick |
-| Start a scenario with one command or button (R2) | **Yes, one command** | `run_scenario` starts an attack or the real jam, and `python scenarios/T2_real_jam.py` (from the repo root) runs a whole scenario and saves its log. There is no button yet |
-| A log file for every run (R2) | **Yes, the Twin's part** | see "The run log" below. The shared format was reviewed with the partners on 9 Oct (JSON Lines, one part file per layer), and the merged file only holds the other layers' events once they write their parts |
+| Start a scenario with one command or button (R2) | **Yes, one command** | `run_scenario` starts an attack or the real jam. One trigger script per scenario is not in this repo yet (see "Scenario scripts"). There is no button yet |
+| A log file for every run (R2) | **Yes, the Twin's part** | see "The run log" below. The format (JSON Lines, one part file per layer) is the Twin's own, used in Phase 1. Triplet D has not agreed one yet. The merged file only holds the other layers' events once they write their parts |
 | Mock Brain and mock Guardian that call the Twin on their own (R1) | **Yes**, thin scripted stand-ins made by the Twin team | `python mocks/mock_brain.py incident --fake-jam`, see "Stand-ins" below |
 | Faults, attacks and one real incident | **Yes**, fake reading, stuck sensor, exact replay, and the real traffic jam `real_jam` | `run_scenario` above |
 | An actuator changing a sensor | **No**, not built | `actuate` stores the commanded value and nothing reacts (a signal change does not ease the jam) |
@@ -147,7 +147,7 @@ python -m twin.logmerge run-42-001 --parts ../brain/run-logs/run-42-001.brain.js
 
 Running it again is safe, the file is rebuilt from the parts every time. Since 27 Oct the Twin's own merge also picks up `run-logs/<run_id>.guardian.jsonl` and `run-logs/<run_id>.brain.jsonl` when they sit in its folder (only those two names, never the private file; a file of another run is skipped with a warning), so a stand-in's or a partner's events are not wiped when the Twin merges. A new run (a new `run_id`) starts with `run_scenario` `reset`, and gets its own file.
 
-**Known gap: partner part files in their own folders.** The decision of 9 Oct says every layer writes `run-logs/<run_id>.<layer>.jsonl` in its OWN folder (`brain/run-logs`, `guardian/run-logs`). The Twin's automatic merge (scenario stop, `reset`, Ctrl+C) only looks in `twin/run-logs/`, so it does not see those files. The Twin's own events always reach `../logs/<run_id>.jsonl`; a partner's events reach it only if you do one of these before or after the run:
+**Known gap: partner part files in their own folders.** The Phase 1 decision (9 Oct, old triplet) was that every layer writes `run-logs/<run_id>.<layer>.jsonl` in its OWN folder (`brain/run-logs`, `guardian/run-logs`). The Twin's automatic merge (scenario stop, `reset`, Ctrl+C) only looks in `twin/run-logs/`, so it does not see those files. The Twin's own events always reach `../logs/<run_id>.jsonl`; a partner's events reach it only if you do one of these before or after the run:
 
 1. copy the partner's part file into `twin/run-logs/` (keep the exact name, and the same `run_id` as the Twin's current run), then stop the scenario or run `reset` again; or
 2. run the merge by hand with the partner files, as in the second command above.
@@ -160,7 +160,7 @@ Limits: normal readings are not logged, so a verdict that points at one will not
 
 ## Scenario scripts (R2)
 
-One script per Test Book scenario lives in `../scenarios/` (repo root, not inside `twin/`): `T1_calm_day.py` to `T7_repeated_command_once.py`. With the Twin running (`python -m twin`, started from this folder), run one from the repo root, for example `python scenarios/T3_fake_jam_refused.py`. Each script resets the run, pulls one trigger, merges the logs of all layers and saves them as `../logs/<ID>-<n>.jsonl` (for example `T3-1.jsonl`), checks the expected result and prints PASS or FAIL. By default our stand-ins play the Brain and the Guardian; `--layers real` (T1, T2, T3, T6) uses the partners' real layers when they run. `../scenarios/README.md` has the details, and `../logs/INDEX.md` says for every saved log whether each layer was a stand-in or real. The Twin also writes its own `../logs/run-42-NNN.jsonl` when a run ends: the same events, not needed in the repo.
+The spec (R2) asks for one trigger and one log file per scenario. The Phase 1 triplet had one script per scenario and a saved log per run. Those scripts and logs stay in the old repository, because they name Phase 1 partners. Triplet D's scripts will go in `../scenarios/` (repo root, not inside `twin/`) and their logs in `../logs/`, once the partners' layers run. Until then, `run_scenario` starts each attack or the real jam with one command (see "Command the Twin by hand"), and the stand-ins in `mocks/` play the Brain and the Guardian.
 
 ## The dashboard (R3)
 
@@ -229,7 +229,7 @@ The keys come from the environment (`TWIN_KEY_CITY_BRAIN`, `TWIN_KEY_GUARDIAN`, 
 
 The token format follows the Twin's setting. An unsigned Twin gets our own unsigned token. A Twin with `tokens.mode: signed` gets Guardian's real `g1` token, signed with Ed25519 (a signature type with two keys: one signs, the other only checks). For that, make a key pair with `python mocks/token_tool.py keygen`, put the public key in a copy of `config/twin.yaml`, and give the mock Guardian the private key with `--private-key` or `MOCK_GUARDIAN_PRIVATE_KEY`. Never commit a private key.
 
-The jam in `incident` is the Brain team's S01 story, with their numbers copied: a congestion index of 80 % or more on two ticks in a row. A tick is one step of the simulated clock.
+The jam in `incident` follows the Phase 1 Brain team's jam rule, with their numbers copied: a congestion index of 80 % or more on two ticks in a row. A tick is one step of the simulated clock.
 
 What they cannot do (say it in the demo):
 
@@ -237,7 +237,7 @@ What they cannot do (say it in the demo):
 * They write run logs (`run-logs/<run_id>.guardian.jsonl` and `.brain.jsonl`, every event marked `stand_in: true`: verdict, decision, partner_failure, escalation), so a run shows reading, verdict, decision, action on the dashboard. `--no-log` turns that off and `--log-dir` changes the folder. Start the Twin, the dashboard and the stand-ins from the `twin/` folder so they share `run-logs/`.
 * They are not a test of the real Brain or the real Guardian. A joint run with the real ones is a separate step.
 
-They are tested by `tests/test_mocks.py` (37 tests, each against a real running Twin, including a Twin in signed mode).
+They are tested by `tests/test_mocks.py`, each test against a real running Twin, including a Twin in signed mode.
 
 ## Test it
 
@@ -367,8 +367,8 @@ This is reference data: no tool and no cap checks distances.
 | Sensor model, simulated clock, readings on the live feed, `get_readings`, `get_clock` | Done 6 Oct |
 | `actuate` with the trust gate, idempotency, caps, `list_actions` | Done 6 Oct |
 | Scenario engine (fake reading, stuck sensor, exact replay) | **Done 7 Oct**; the real jam `real_jam` was added on 3 Nov |
-| Scenario scripts T1 to T7 in `../scenarios/` (R2), logs in `../logs/` | **Done 4 Nov** (logs from the stand-ins; not yet run against the partners' real layers) |
-| Run log: part file, private file, merge (R2) | **Done 7 Oct**, format reviewed with partners 9 Oct |
+| Scenario trigger scripts and logs (R2) | Phase 1 scripts live in the old repo. Not copied here, to be rebuilt against Triplet D's layers |
+| Run log: part file, private file, merge (R2) | **Done 7 Oct**. The format is the Twin's own, Triplet D has not agreed one yet |
 | Containment tools (isolate, quarantine, rollback, release) | **Done 7 Oct** |
 | Shared log format, dashboard (dark look, node style spec, made-up map) | **Done 7 Oct, restyled 10 Oct** |
 | Dry-run preview (`preview_action`) and the `PREVIEW_REQUIRED` rule | **Done 16 Oct** |
@@ -389,9 +389,9 @@ This is reference data: no tool and no cap checks distances.
 * `tokens.mode` is `unsigned` in the default config, with a loud warning at startup, so a fresh Twin accepts our own unsigned test tokens. Signed mode
   (Ed25519, Guardian's `g1` tokens) is built and tested: set `tokens.mode: signed` and `tokens.guardian_public_key` to Guardian's public key, and use it for
   any run with the real Guardian. `tokens.min_score` is empty because nobody has agreed a number.
-* `preview_required` is enforced (`actions.preview_enforced: true`). Previews are remembered in memory only, so a restart forgets them and the Brain just previews again. `actions.preview_valid_ticks: 60` was agreed on 16 Oct (D9). Only the Brain may preview. Previews are not written to the run log (no new event type was agreed).
+* `preview_required` is enforced (`actions.preview_enforced: true`). Previews are remembered in memory only, so a restart forgets them and the Brain just previews again. `actions.preview_valid_ticks: 60` was agreed on 16 Oct. Only the Brain may preview. Previews are not written to the run log (no new event type was agreed).
 * The action cap is per request. The isolation and rollback pools are cumulative and hold until `release_device` or a new run.
-* `list_actions` shows both kinds of limit: `action_cap` on each action, and `isolation_caps` per domain (nodes, and the most that may be isolated or quarantined at once). The isolation numbers are the same as the pools in `get_containment_state`, which also shows how much is in use (D8, 16 Oct).
+* `list_actions` shows both kinds of limit: `action_cap` on each action, and `isolation_caps` per domain (nodes, and the most that may be isolated or quarantined at once). The isolation numbers are the same as the pools in `get_containment_state`, which also shows how much is in use (16 Oct).
 * Used token ids are remembered until they expire, in memory only. A restart forgets them. A restarted Twin starts again at tick 0 with the SAME run id
   (`run-42-001` for seed 42), so a token that was already used and has not expired yet would be accepted a second time. Only a scenario reset
   (8 Oct) creates a new run id. Not a problem for the demo, but do not claim restarts protect against replay.
@@ -410,7 +410,7 @@ This is reference data: no tool and no cap checks distances.
 * **Caps** count nodes per domain. `actuate` counts a shared node in every domain it belongs to.
 * **Messages:** strict JSON out, unknown extra fields ignored. Time is simulated UTC plus `tick`.
 * **Log:** `run-logs/<run_id>.twin.jsonl`, merged into `logs/`. Fields: `run_id`, `event_id`, `timestamp`, `tick`, `layer`, `event_type`, `caused_by`, `data`.
-* **Implemented:** everything on the card, including the city graph (`get_city_graph`, `get_nearest_nodes`), which is our extra and was agreed with CIVIS in a weekly meeting (recorded in the meeting notes).
+* **Implemented:** everything on the card, including the city graph (`get_city_graph`, `get_nearest_nodes`), which is our own extra (not required by the spec).
 * **Planned, not built:** two-step commit (`commit_action`) and `get_flagged_readings`. Telecom and Waste were cut on 2 Nov.
 * **Final:** the dispatch place field is `destination`.
 
@@ -427,7 +427,7 @@ This is reference data: no tool and no cap checks distances.
 **Units:** congestion 0-100 %, water cm above the sensor's own zero, power kW, PM2.5 ug/m3. `channel` is set only for sensors split by type (`emergency_calls`: accident, fire, flood, medical; `units_free`: police, ambulance, fire). A reading's `timestamp` may be a few ms off its tick.
 
 **Details cut from the Interface Card (v10 to v11, 4 Nov, so it fits one page):**
-* `get_capabilities` is what the decision report calls "describe capabilities"; Guardian's is named `describe_capabilities`. Its `features` list token formats and mode, preview, sensors and what is not built.
+* `get_capabilities` is the Twin's capabilities tool. Its `features` list token formats and mode, preview, sensors and what is not built.
 * `get_city_graph` (`include_matrix`?, `include_roads`?) returns 38 nodes (GPS, zone, domains, sensors, actions with risk), 67 links (`distance_m`, `bearing_a_to_b_deg`, `kind`), zones, roads and `distance_matrix_m` between every pair in `node_order`. The distances are straight lines, not along roads or pipes, and fixed for the run. `get_nearest_nodes` takes `node_id`, `domain`?, `role`?, `limit`? (1 to 50, default 5) and refuses with `UNKNOWN_NODE`, `UNKNOWN_ROLE` or `BAD_LIMIT`.
 * `lat`/`lon` are the node's GPS (WGS84 degrees, 5 decimals, fixed for the run). The city is invented and the anchor point is arbitrary. Nothing in the Twin checks the distances.
 * Tokens: Guardian's `g1.<payload>.<signature>` is always signed (claims `token_id`, `trust_score`, `idempotency_key`, times in seconds); a `g1` token with an `idempotency_key` only works with that same key. Our own `header.payload.signature` uses `jti` and `score`. Both need `iss` guardian, `aud` twin, `run_id`, `exp`, `action`, `targets`, `params`; lifetime 1 to 60 s, score 0 to 1, single use. Times use the Twin's clock (`get_clock`); at real speed 1 tick = 1 s.
