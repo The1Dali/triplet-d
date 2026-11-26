@@ -1,6 +1,6 @@
 # Twin: Interface Card (v12, 4 Nov 2026)
 
-The Twin is the simulated city: it sends sensor readings and receives actuator commands. It calls no other layer. **Tested version: tag `twin-v1.0`.**
+The Twin is the simulated city: it sends sensor readings and receives actuator commands. It calls no other layer. **Tested with: Python 3.12.14 and `mcp` 2.3.0.**
 
 ## Connect and authenticate
 * MCP over HTTP, protocol `2026-07-28`: `http://<twin-host>:8000/mcp`. Live feed (SSE, needs a key): `GET /events`, with `hello`, one `readings` event per tick, `heartbeat` when quiet. `GET /health` needs no key.

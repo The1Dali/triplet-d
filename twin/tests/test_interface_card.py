@@ -34,8 +34,7 @@ def test_every_sensor_and_its_unit_are_in_the_units_section():
         assert f"`{sensor}` {spec['unit']}" in units, f"{sensor} / {spec['unit']} missing or wrong in the card"
 
 
-def test_card_names_the_tested_tag_and_separates_implemented_from_planned():
-    assert re.search(r"Tested version: tag `twin-v\d+\.\d+`", CARD)
+def test_readme_separates_implemented_from_planned():
     readme = (__import__("pathlib").Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
     assert "**Implemented:**" in readme and "**Planned, not built:**" in readme
 
