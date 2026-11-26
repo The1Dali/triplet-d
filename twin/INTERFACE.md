@@ -20,6 +20,8 @@ The Twin is the simulated city: it sends sensor readings and receives actuator c
 | `get_containment_state`, `get_quarantine_lane` | Brain, Guardian | none | cut-off devices, cap use, held commands |
 | `run_scenario` | `scenario` key | `name`, `params`? | names: `fake_reading`, `stuck_sensor`, `replay_exact`, `real_jam`, `list`, `stop`, `reset` |
 
+**The `token` for `actuate`.** Every `actuate` call needs a token the Guardian issues for that one action. It names the action and targets, carries a trust score from 0 to 1, and lives at most 60 simulated seconds. A token works once, and the Twin spends it only when the action commits, so a refused call does not use it up. Two formats are accepted: `g1.<payload>.<signature>` (Ed25519, checked against the Guardian's public key; it also names the `idempotency_key` it is valid for) and a plain `header.payload.signature` for tests and unsigned mode. Actions marked `preview_required` in `list_actions` (the valve and the grid switch) need a `preview_action` of the same request first, valid 60 ticks, otherwise the Twin answers `PREVIEW_REQUIRED`. Token refusals: `TOKEN_MISSING`, `TOKEN_INVALID`, `TOKEN_WRONG_RUN`, `TOKEN_EXPIRED`, `TOKEN_REUSED`, `TOKEN_MISMATCH`, and `TOKEN_SCORE_TOO_LOW` (only when a minimum score is configured, and none is set now). Sample tokens: `python mocks/token_tool.py make --help`.
+
 ## Units (as sent in each reading)
 `vehicle_count` cars/min, `avg_speed` km/h, `congestion_index` percent (0 to 100), `water_level` cm, `flow_rate` L/s, `load_kw` kW, `voltage_v` V, `pm25` ug/m3, `co_ppm` ppm, `temperature_c` C, `emergency_calls` calls/min, `units_free` units.
 
