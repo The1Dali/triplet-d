@@ -156,7 +156,7 @@ class DashboardCfg(_Strict):
     host: str = "127.0.0.1"
     port: int = 8080
     # Folders (or files) with run logs. Part files and merged files may both be listed: the same event is only shown once.
-    # The last two are GUESSES at where CIVIS and 9antra keep their part files. A folder that does not exist is ignored.
+    # The last two are GUESSES at where the Brain and the Guardian keep their part files (a guess at the repo layout, to be confirmed with the Triplet D partners). A folder that does not exist is ignored.
     sources: list[str] = ["run-logs", "../logs", "../brain/run-logs", "../guardian/run-logs"]
     refresh_seconds: float = Field(default=1.0, ge=0.2)
     window_ticks: int = Field(default=60, ge=0)          # 0 = the whole run

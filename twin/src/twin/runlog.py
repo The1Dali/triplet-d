@@ -6,8 +6,7 @@ Two steps, so three layers never write into one file at the same time:
      (the spec's `logs/` folder, "one file per run").
 
 The file format is JSON Lines: one JSON object per line. Why: if the Twin crashes, only the last line can be broken,
-and a program can read the file while it is still being written. The format below is OUR DRAFT (proposed to CIVIS and
-9antra, review on 9 Oct). All of it is in this one file, so a change is cheap.
+and a program can read the file while it is still being written. The format below is the Twin's own proposal; Triplet D has not agreed one yet (see README.md, "Rules and status").. All of it is in this one file, so a change is cheap.
 
 Every line has:
   run_id, event_id (twin-000001), timestamp (simulated time of the tick), tick, wall (real clock, orders events inside one

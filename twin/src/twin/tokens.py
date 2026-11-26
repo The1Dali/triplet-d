@@ -1,7 +1,6 @@
 """Guardian's permission token: "this exact action, this score, valid until this time, usable once".
 
-Format (our proposal for 9antra to confirm, not agreed yet; JWS compact, the same shape as a JWT):
-    base64url(header) . base64url(payload) . base64url(signature)
+Format (JWS compact, the same shape as a JWT; the written spec is the Interface Card, twin/INTERFACE.md):    base64url(header) . base64url(payload) . base64url(signature)
 The mode (signed or unsigned) comes from the Twin's config and never from the token, so a token cannot
 argue its way into being "unsigned". In signed mode only EdDSA (Ed25519) is accepted.
 
@@ -86,7 +85,7 @@ def _epoch_to_iso(value) -> str:
 
 
 def _read_g1(token: str, parts: list[str], cfg: TokensCfg) -> TokenClaims:
-    """Guardian's own format (9antra, docs/TOKEN.md): g1.<payload>.<signature>, always signed with Ed25519.
+    """Guardian's `g1` format (carried over from Phase 1, summarised in INTERFACE.md): g1.<payload>.<signature>, always signed with Ed25519.
 
     Differences from our first proposal: the first part is the fixed word "g1" (not a JSON header), the claims are
     called token_id and trust_score, times are numbers (seconds since 1970, from the Twin's simulated clock), and
