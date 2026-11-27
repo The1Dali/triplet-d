@@ -5,7 +5,8 @@
         --params '{"position": 40}' [--private-key <base64>] [--score 0.9] [--ttl 30] [--now 2026-10-05T08:00:00.000Z]
 
 Without --private-key the token is UNSIGNED (works only while tokens.mode is "unsigned" in config/twin.yaml).
---now is the simulated time to issue the token at (ask get_clock). Default: the clock's start time.
+--now is the simulated time to issue the token at (ask get_clock). Default: the clock's start time
+(with clock.start: now, that is the real time when you run this command).
 """
 import argparse
 import base64
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey          # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat  # noqa: E402
 
+from twin.clock import resolve_start                                                     # noqa: E402
 from twin.settings import load_config                                                    # noqa: E402
 from twin.tokens import make_token                                                       # noqa: E402
 from twin.util import format_rfc3339                                                     # noqa: E402
@@ -45,7 +47,7 @@ def main() -> None:
         print("private (keep secret, never commit):", base64.b64encode(key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())).decode())
         print("public  (goes in tokens.guardian_public_key):", base64.b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode())
         return
-    now = datetime.fromisoformat(a.now or load_config().clock.start)
+    now = datetime.fromisoformat(a.now or resolve_start(load_config().clock.start))
     key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(a.private_key)) if a.private_key else None
     print(make_token({
         "iss": "guardian", "aud": "twin", "jti": f"tk-{uuid.uuid4().hex[:8]}", "run_id": a.run_id,

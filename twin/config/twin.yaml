@@ -14,9 +14,13 @@ sse:
   heartbeat_seconds: 15       # how often /events sends a heartbeat when nothing else happens
 
 # ---------------------------------------------------------------------------
-# Simulated clock (CIVIS convention, 4 Oct): every reading carries simulated UTC time (RFC 3339, with Z)
-# plus an integer tick. tick_seconds is the simulated length of one tick. speed 1.0 = real speed, so the
-# spec's "10 s" means 10 real seconds. Raise speed only for fast tests.
+# Simulated clock: every reading carries simulated UTC time (RFC 3339, with Z) plus an integer tick.
+# tick_seconds is the simulated length of one tick. speed 1.0 = real speed, so the spec's "10 s" means 10 real
+# seconds. Raise speed only for fast tests.
+# start is a fixed UTC time (the default: every run and test repeats exactly) or the word now, which means the real
+# time at launch. Use now for a joint run: a partner that checks freshness against its own clock, or signs tokens
+# with the real time, refuses a start date in the past. The same switch from the environment: TWIN_CLOCK_START=now.
+# With now, keep speed 1.0 and autorun true, otherwise the clock drifts away from real time (the Twin warns at startup).
 # ---------------------------------------------------------------------------
 clock:
   start: "2026-10-05T08:00:00.000Z"

@@ -4,14 +4,17 @@ Readings are never stored here. observed readings for any tick are calculated on
 (seed, tick), see sensors.py. This class only knows which tick we are at and wakes up listeners when it moves.
 """
 import asyncio
+import logging
 import time
 from datetime import timedelta
 
-from .clock import SimClock
+from .clock import START_NOW, SimClock, resolve_start
 from .models import ClockInfo, Reading, ReadingsBatch, Topology
 from .sensors import Device, SensorModel, devices_from_nodes
 from .settings import TwinConfig
 from .util import format_rfc3339
+
+log = logging.getLogger("twin.sim")
 
 
 def sensor_domains(config: TwinConfig) -> dict[str, str]:
@@ -30,7 +33,10 @@ class Simulation:
     def __init__(self, topology: Topology, config: TwinConfig):
         self.seed = topology.seed
         self.cfg = config.clock
-        self.clock = SimClock(self.cfg.start, self.cfg.tick_seconds)
+        self.real_time = self.cfg.start == START_NOW         # clock.start: now. Tick 0 is the real moment of launch
+        self.clock = SimClock(resolve_start(self.cfg.start), self.cfg.tick_seconds)
+        if self.real_time:
+            self._warn_if_clock_cannot_follow_real_time()
         self.devices: list[Device] = devices_from_nodes(topology.nodes, sensor_domains(config))
         self.model = SensorModel(self.seed, config.sensor_model, self.devices)
         self.node_ids = {n.node_id for n in topology.nodes}
@@ -93,6 +99,23 @@ class Simulation:
         return ClockInfo(run_id=self.run_id, tick=self.tick, time=self.clock.iso_of(self.tick),
                          tick_seconds=self.clock.tick_seconds, speed=self.cfg.speed, running=self.running)
 
+    # ------------------------------------------------------------ real-time mode (clock.start: now)
+    def _anchor_to_now(self) -> None:
+        """Tick 0 is this moment. Called when the ticking starts and on every reset, so simulated time and real time agree
+        at tick 0 of every run. The clock object is replaced, never edited: SimClock itself stays a plain calculation."""
+        self.clock = SimClock(resolve_start(START_NOW), self.cfg.tick_seconds)
+
+    def _warn_if_clock_cannot_follow_real_time(self) -> None:
+        # Ticks come every tick_seconds / speed real seconds and each one adds tick_seconds of simulated time,
+        # so simulated seconds per real second is simply `speed`.
+        if abs(self.cfg.speed - 1.0) > 1e-9:
+            log.warning("clock.start is 'now' but clock.speed is %s: simulated time runs %sx as fast as real time. "
+                        "Timestamps will drift away from real time, and a partner that checks freshness will refuse them. "
+                        "Use speed 1 for joint runs.", self.cfg.speed, self.cfg.speed)
+        if not self.cfg.autorun:
+            log.warning("clock.start is 'now' but clock.autorun is false: the clock stands still at the launch time, so it "
+                        "falls behind real time. Fine for tests, not for a joint run.")
+
     # ------------------------------------------------------------ moving time
     async def advance(self, n: int = 1) -> None:
         async with self._changed:
@@ -104,6 +127,8 @@ class Simulation:
         async with self._changed:
             self.run_number += 1
             self.tick = 0
+            if self.real_time:
+                self._anchor_to_now()            # a new run starts at the real time of the reset, not at the launch time
             self._changed.notify_all()
 
     async def wait_for_change(self, run_number: int, tick: int, timeout: float) -> bool:
@@ -122,6 +147,8 @@ class Simulation:
         does not make every later tick late."""
         interval = self.cfg.tick_seconds / self.cfg.speed
         self.running = True
+        if self.real_time and self.tick == 0:
+            self._anchor_to_now()                # the first tick starts now, not whenever the app was built
         next_at = time.monotonic() + interval
         try:
             while True:

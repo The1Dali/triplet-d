@@ -1,10 +1,11 @@
-# Twin: Interface Card (v12, 4 Nov 2026)
+# Twin: Interface Card (v13, 27 Nov 2026)
 
 The Twin is the simulated city: it sends sensor readings and receives actuator commands. It calls no other layer. **Tested with: Python 3.12.14 and `mcp` 2.3.0.**
 
 ## Connect and authenticate
 * MCP over HTTP, protocol `2026-07-28`: `http://<twin-host>:8000/mcp`. Live feed (SSE, needs a key): `GET /events`, with `hello`, one `readings` event per tick, `heartbeat` when quiet. `GET /health` needs no key.
 * `Authorization: Bearer <key>` on every call, one key per caller: `city_brain`, `guardian`, and a hidden `scenario` key. Keys live in the Twin's `.env`, never in the repo: `TWIN_KEY_CITY_BRAIN`, `TWIN_KEY_GUARDIAN`, `TWIN_KEY_SCENARIO`.
+* Time: every reading has a UTC `timestamp` (RFC 3339, milliseconds) and a `tick`. By default the clock starts on a fixed date (5 Oct 2026), so runs repeat exactly. For a joint run start the Twin with `TWIN_CLOCK_START=now` (or `clock.start: now`): tick 0 is then the real launch time, one tick per real second, so readings and token times match a partner's real clock. `get_clock` shows the current simulated time.
 * Pointing at another partner: addresses are settings in your own config. Ours, `config/twin.yaml`: `server` (host, port), `partners` (URLs), `dashboard.sources` (log folders). Nothing is hard-coded.
 
 ## What it receives (tools)
@@ -32,7 +33,7 @@ Reading in the feed (`value` is what the sensor reports and can be wrong, `null`
  "node_id": "TRF-01", "device_id": "TRF-01.avg_speed", "sensor": "avg_speed", "channel": null, "value": 35.6, "unit": "km/h",
  "lat": 35.98748, "lon": 9.96593}
 ```
-`actuate` with `{"action": "set_valve_position", "targets": ["WAT-01"], "params": {"position": 40}, "token": "...", "idempotency_key": "demo-1"}` returns:
+After a `preview_action` of the same request, `actuate` with `{"action": "set_valve_position", "targets": ["WAT-01"], "params": {"position": 40}, "token": "...", "idempotency_key": "demo-1"}` returns:
 ```json
 {"status": "committed", "action": "set_valve_position", "targets": ["WAT-01"], "params": {"position": 40.0}, "action_id": "ac-00001", "code": null, "replayed": false}
 ```
