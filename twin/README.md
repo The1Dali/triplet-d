@@ -4,7 +4,7 @@ The Twin is the simulated city: sensors that report readings, actuators that act
 the City Brain and the Guardian call. It runs on its own. This README only covers the Twin. How the three layers
 fit together will be in the root `INTEGRATION.md` (still a draft). What the Twin sends and receives is in `INTERFACE.md`.
 
-**Status (26 Nov 2026): 550 tests pass and 18 are skipped (fresh `pytest` run inside `twin/`).** This is the Phase 1 Twin carried into Triplet D. It has not been run against Triplet D's Brain or Guardian yet. Built: the city generated from a seed, a simulated clock, 120 sensor readings per tick on the live feed and through `get_readings`, one key per caller, `actuate` behind the token gate with idempotency and caps, dry-run preview (`preview_action`), containment tools, attack scenarios and one real incident (`real_jam`), the run log, the dashboard, scripted stand-ins for the Brain and the Guardian (`mocks/`), and optional TimescaleDB history and Redis action state (both off by default). Not built: two-step commit, undo of committed actions, and actuator effects on the city. The signed-token check (Ed25519) is built and tested but off in the default config (see "Known limits right now").
+**Status (27 Nov 2026): 575 tests pass and 18 are skipped (fresh `pytest` run inside `twin/`).** This is the Phase 1 Twin carried into Triplet D. It has not been run against Triplet D's Brain or Guardian yet. Built: the city generated from a seed, a simulated clock, 120 sensor readings per tick on the live feed and through `get_readings`, one key per caller, `actuate` behind the token gate with idempotency and caps, dry-run preview (`preview_action`), containment tools, attack scenarios and one real incident (`real_jam`), the run log, the dashboard, scripted stand-ins for the Brain and the Guardian (`mocks/`), and optional TimescaleDB history and Redis action state (both off by default). Not built: two-step commit, undo of committed actions, and actuator effects on the city. The signed-token check (Ed25519) is built and tested but off in the default config (see "Known limits right now").
 
 ## Run it
 
@@ -92,7 +92,7 @@ One command starts an attack. With no `params` each one has a default sensor, so
 | `stuck_sensor` | Keeps repeating the last value it reported before the fault. |
 | `replay_exact` | Re-sends an old reading exactly as it was (same `reading_id`, old tick and time), `lag_ticks` old. |
 | `real_jam` | Not an attack: a REAL traffic jam (see below). |
-| `list`, `stop`, `reset` | List the scenarios. Stop one (`{"scenario_id": "sc-0001"}`). Start a new run (new run id, clock at 0, everything forgotten). |
+| `list`, `stop`, `reset` | List the scenarios. Stop one (`{"scenario_id": "sc-0001"}`). Start a new run (new run id, clock at 0, everything forgotten). With `clock.start: now` the new run starts at the real time of the reset. |
 
 Params for the attacks: `device_id`, `channel` (only for sensors with channels), `delay_ticks` (at least 1, default 2: a fault never changes readings that were already sent), `duration_ticks` (default: until stopped), plus `value` or `lag_ticks`. Two faults on the same sensor at the same time are refused. A replay needs `lag_ticks` of history first, so at the very start of a run it answers `START_TOO_EARLY`.
 
@@ -257,6 +257,22 @@ python -m twin.generator --out generated
 Writes `generated/topology.json` (nodes) and `generated/layout.json` (zones and roads only, no nodes). The same seed
 always gives the same city. Change the seed with `TWIN_SEED=7` or in `config/twin.yaml`.
 
+## Real-time clock (27 Nov)
+
+By default the simulated clock starts on a fixed date (5 Oct 2026, 08:00 UTC), so a seeded run repeats exactly, timestamps
+included. A partner that checks freshness against its own clock, or signs tokens with the real time, refuses that: the
+readings look weeks old and its tokens look dated in the future (`TOKEN_INVALID`). For a joint run start the Twin on real time:
+
+```
+TWIN_CLOCK_START=now python -m twin        # or set  clock.start: now  in config/twin.yaml
+```
+
+Tick 0 is then the moment of launch and one tick is one real second, so readings, tokens and logs carry the real date and time.
+A scenario `reset` starts the new run at the real time of the reset, not at the launch time. The sensor values do not
+change: they depend only on the seed and the tick, so the same run gives the same numbers either way. Keep `clock.speed` at 1.0
+and `clock.autorun` on, otherwise the clock drifts away from real time (the Twin logs a warning at startup). `clock.start` accepts a
+fixed UTC time or the word `now` and nothing else: anything else stops the Twin at startup with a message that says what to fix.
+
 ## History storage (13 Oct)
 
 The Twin can keep a history of what happened: every reading the live feed showed (the reported value, never the true
@@ -381,7 +397,7 @@ This is reference data: no tool and no cap checks distances.
 
 * The real jam does not react to actions: nothing in the city answers a signal change yet. It is the only real incident (no flood, no power surge).
 * The log merge does not search the partners' own `run-logs/` folders. See "Known gap" in "The run log" above.
-* Wall-clock timestamps are used only for `/health` and the feed's hello and heartbeat. Readings use the simulated clock.
+* Wall-clock timestamps are used only for `/health` and the feed's hello and heartbeat. Readings use the simulated clock. With `clock.start: now` the simulated clock follows real time (see "Real-time clock").
 * Sensor values wander slowly (waves of 5 to 20 simulated minutes), not through a realistic day. At real speed a daily cycle
   would never be visible in a demo. Incidents come from scenarios, not from the background pattern.
 * Nothing changes the city yet: `actuate` stores the commanded value but no sensor reacts to it. Readings are a function of the seed, the tick
@@ -398,7 +414,7 @@ This is reference data: no tool and no cap checks distances.
 * A feed reader that falls more than 100 ticks behind skips ahead. The first `readings` event after the jump has a `skipped_ticks` number. Fixed 17 Oct: before, a reader that was stuck while the clock ran lost ticks with no warning (`tests/test_feed_stream.py`).
 * Reconnecting to `/events` starts at the current tick. Ticks missed while disconnected are not replayed, and the `Last-Event-ID` header is ignored. Use `get_readings` after a reconnect if you need the latest state.
 * `tools/list` shows every tool except the hidden scenario tool to every caller, but `get_capabilities` now lists only the tools the caller can really call.
-* `mocks/token_tool.py make` defaults to a 30-second token issued at the clock's start time, so it expires quickly. Pass `--ttl 3600` (or `--now` from `get_clock`).
+* `mocks/token_tool.py make` defaults to a 30-second token issued at the clock's start time, so it expires quickly. Pass `--ttl 3600` (or `--now` from `get_clock`). With `clock.start: now`, "the clock's start time" is the real time when you run the tool.
 * `ServerMiddleware` in the `mcp` SDK is marked provisional by its authors. We pin `mcp==2.3.0`, so it cannot change
   under us, but upgrading needs a re-test.
 

@@ -13,6 +13,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .clock import START_NOW
+
 TWIN_ROOT = Path(__file__).resolve().parents[2]      # the twin/ folder
 DEFAULT_CONFIG = TWIN_ROOT / "config" / "twin.yaml"
 
@@ -36,19 +38,21 @@ class SseCfg(_Strict):
 
 
 class ClockCfg(_Strict):
-    start: str = "2026-10-05T08:00:00.000Z"
+    start: str = "2026-10-05T08:00:00.000Z"      # a fixed UTC time (repeatable runs), or the word "now" (real time at launch)
     tick_seconds: float = Field(1.0, gt=0)
     speed: float = Field(1.0, gt=0)
     autorun: bool = True
 
     @model_validator(mode="after")
     def _check(self):
+        if self.start == START_NOW:
+            return self
         if not self.start.endswith("Z"):
-            raise ValueError("clock.start must be UTC with a Z, for example 2026-10-05T08:00:00.000Z")
+            raise ValueError('clock.start must be the word now, or a UTC time with a Z, for example 2026-10-05T08:00:00.000Z')
         try:
             datetime.fromisoformat(self.start)
         except ValueError:
-            raise ValueError("clock.start is not a valid RFC 3339 time") from None
+            raise ValueError('clock.start is not a valid RFC 3339 time (or the word now)') from None
         return self
 
 
@@ -315,7 +319,7 @@ class Settings(BaseModel):
 
 
 def load_config(config_path: Path | str | None = None) -> TwinConfig:
-    """Read config/twin.yaml (no secrets needed), apply the TWIN_SEED override, fail with a clear message."""
+    """Read config/twin.yaml (no secrets needed), apply the TWIN_SEED and TWIN_CLOCK_START overrides, fail with a clear message."""
     path = Path(config_path or os.environ.get("TWIN_CONFIG") or DEFAULT_CONFIG)
     if not path.is_absolute():
         path = TWIN_ROOT / path
@@ -330,6 +334,9 @@ def load_config(config_path: Path | str | None = None) -> TwinConfig:
             raw["seed"] = int(os.environ["TWIN_SEED"])
         except ValueError:
             raise ConfigError("TWIN_SEED must be a whole number, for example TWIN_SEED=42") from None
+    if os.environ.get("TWIN_CLOCK_START", "").strip():              # for example TWIN_CLOCK_START=now in the compose file
+        if isinstance(raw.get("clock"), dict):
+            raw["clock"]["start"] = os.environ["TWIN_CLOCK_START"].strip()
     try:
         return TwinConfig.model_validate(raw)
     except ValidationError as exc:
